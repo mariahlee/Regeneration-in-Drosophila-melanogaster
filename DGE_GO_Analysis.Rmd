@@ -1,0 +1,1347 @@
+---
+title: "Regeneration in Drosophila - Differential Expression and Gene Ontology" 
+author: "Mariah Lee" 
+date: "Last updated: 10.21.2024" 
+output: 
+  pdf_document: 
+    latex_engine: lualatex
+  html_document:
+    df_print: paged
+editor_options:
+  markdown:
+    wrap: 60
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(tidy = FALSE)
+```
+
+## Install and load packages
+
+This section installs and loads the required CRAN and Bioconductor packages for analysis.
+
+```{r Load Packages, message=FALSE, warning=FALSE, include=FALSE}
+
+# List necessary packages
+packages <- c("knitr", "data.table", "dplyr", "BiocManager", "htmltools", 
+              "tinytex", "circlize", "RColorBrewer", "parallel", "UpSetR",
+              "tidyr", "ggplot2", "biomaRt", "gt", "magrittr","devtools",
+              "bedtoolsr", "R.utils", "VennDiagram", "openxlsx")
+bioc_packages <- c("ComplexHeatmap", "edgeR", "EnhancedVolcano", 
+                   "Glimma",  "rtracklayer", "limma", "BiocParallel",
+                   "clusterProfiler", "org.Dm.eg.db", "AnnotationDbi", 
+                   "enrichplot", "ReactomePA")
+
+# Function to install and load packages
+install_and_load <- function(pkg, bioc=FALSE) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (bioc) {
+      BiocManager::install(pkg, force = TRUE, lib = "/home/mariah/R/x86_64-pc-linux-gnu-library/4.4")
+    } else {
+      install.packages(pkg, force = TRUE, lib = "/home/mariah/R/x86_64-pc-linux-gnu-library/4.4")
+    }
+  }
+  library(pkg, character.only = TRUE, lib.loc = "/home/mariah/R/x86_64-pc-linux-gnu-library/4.4")
+}
+
+# Install and load CRAN and Bioconductor packages
+lapply(packages, install_and_load)
+lapply(bioc_packages, install_and_load, bioc=TRUE)
+
+```
+
+## Set up directories for data and output storage
+
+This section sets up directories for data storage and ensures that required directories exist.
+
+```{r Directories, echo=TRUE, message=FALSE, warning=FALSE}
+# Set the working directory for the project
+working_directory <- "/home/mariah/Regeneration_in_Dmelanogaster" 
+# there is no / at the end because of the use of file.path
+setwd(working_directory)
+
+# Define the sub-directories for the data and output
+diff_expr_directory <- file.path(working_directory, "differential_expression")
+read_counts_directory <- file.path(working_directory, "reads/read_counts")
+bedtools_directory <- file.path(working_directory, "bedtools")
+
+# Ensure subdirectories exist
+if (!dir.exists(diff_expr_directory)) {
+    stop("Error: The 'diff_counts' directory does not exist. 
+         There is no metadata available.")
+}
+if (!dir.exists(read_counts_directory)) {
+    stop("Error: The 'read_counts' directory does not exist. 
+         There is no count data available.")
+}
+if (!dir.exists(bedtools_directory)) {
+  dir.create(bedtools_directory, recursive = TRUE)
+}
+```
+
+## Read in data
+
+This section loads the count data and metadata, ensuring both are aligned for analysis.
+
+```{r Read Data, echo=FALSE}
+
+gtf_path <- "~/DrosophilaProject/genome/annotation/dmel-all-r6.57.gtf.gz"
+genome_path <- "~/DrosophilaProject/genome/dmel-all-chromosome-r6.57.fasta"
+
+# Call the combining_counts.R script
+combine_counts_path <- file.path(working_directory, "scripts", "combining_counts.R")
+
+# Check if the file exists
+if (!file.exists(combine_counts_path)) {
+  stop("Error: The file 'combining_counts.R' does not exist at the specified path.")
+}
+system(paste("Rscript", combine_counts_path))
+
+# Load count data created with combining_counts.R script
+count_data_path <- file.path(read_counts_directory, "RH_combined_counts.csv")
+count_data <- read.csv(count_data_path, row.names = 1)
+
+# Change the order, so replicates are next to each other (for figures)
+desired_order <- c("RH1_S1", "RH5_S5", 
+                   "RH2_S2", "RH6_S6",
+                   "RH3_S3", "RH7_S7",
+                   "RH4_S4", "RH8_S8")
+count_data <- count_data[, desired_order]
+
+# Load and update metadata
+metadata_path <- file.path(diff_expr_directory, "regen_metadata.csv")
+metadata <- read.csv(metadata_path, row.names = 1)
+metadata <- metadata %>%
+  mutate(
+    Stage = ifelse(grepl("early", Condition), "early", "late"),
+    Condition = ifelse(grepl("undamaged", Condition), "undamaged", "damaged"),
+    Replicate = factor(gsub(".*_", "", Sample_name))
+  )
+
+# Change the metadata order to match count_data
+metadata <- metadata[desired_order, ]
+print(metadata)
+
+# Ensure column names in count_data match row names in metadata
+all(colnames(count_data) %in% rownames(metadata))
+all(colnames(count_data) == rownames(metadata))
+
+```
+
+## Data Wrangling and Visualization
+
+This section creates the DGEList, normalizes, filters the data, and generates visualizations such as boxplots for raw and normalized data.
+
+```{r Data Wrangling, echo=TRUE, results='hide'}
+
+# Create DGEList object for edgeR
+metadata$Group <- factor(paste(metadata$Stage, 
+                               metadata$Condition, 
+                               metadata$Replicate, sep = "_"))
+dge <- DGEList(counts = count_data, 
+               samples = data.frame(group = metadata$Group), 
+               genes = row.names(count_data), 
+               remove.zeros = TRUE)
+
+# Custom color palette
+colors = c("lightskyblue", "lightskyblue",
+           "indianred1", "indianred1",
+           "royalblue","royalblue",
+           "firebrick3", "firebrick3")
+
+# Plot raw data as counts per million (CPM)
+cpm <- cpm(dge, log=FALSE)
+png(file = file.path(diff_expr_directory, "cpm_counts_boxplot.png"), 
+    width = 1920, height = 1080, res = 300)
+cpm_box <- boxplot(cpm, las=2, cex.axis=0.5, 
+            col=colors, 
+            main="Counts - Not Normalized", 
+            ylab="CPM")
+dev.off()
+
+# Calculate normalization factors and store in dge_norm
+dge <- calcNormFactors(dge)
+
+# Convert normalized counts to log-CPM for visualization
+norm_cpm <- cpm(dge, log=TRUE)
+
+# Plot normalized data
+png(file = file.path(diff_expr_directory, "normalized_counts_boxplot.png"), 
+    width = 1920, height = 1080, res = 300)
+lcpm_box <- boxplot(norm_cpm, las=2, cex.axis=0.5, 
+              col=colors, 
+              main="Counts - Normalized", ylab="Log-CPM")
+dev.off()
+
+# Create design matrix including interaction terms and replicates
+design <- model.matrix(~0 + metadata$Stage*metadata$Condition 
+                       + metadata$Replicate)
+
+# Filtering lowly expressed genes using edgeR
+keep <- filterByExpr(dge, design = design)
+dge_filtered <- dge[keep,]
+
+# View remaining genes and samples after filtering
+summary(keep)
+
+# Convert filtered normalized counts to log-CPM for visualization
+norm_cpm_filtered <- cpm(dge_filtered, log=TRUE)
+
+# Plot filtered normalized data
+png(file = file.path(diff_expr_directory, 
+                     "filtered_normalized_counts_boxplot.png"), 
+    width = 1920, height = 1080, res = 300)
+lcpm_filter_box <- boxplot(norm_cpm_filtered, las=2, cex.axis=0.5, 
+                    col=colors, 
+                    main="Filtered Counts - Normalized", ylab="Log-CPM")
+dev.off()
+
+# Save normalized data
+normalized_file <- file.path(diff_expr_directory, "regen_normalized_cpm.csv")
+write.csv(norm_cpm, file = normalized_file, row.names = TRUE)
+write.table(norm_cpm, file = normalized_file, sep = "\t")
+
+# Save filtered normalized data
+filtered_normalized_file <- file.path(diff_expr_directory, 
+                                      "regen_filtered_normalized_cpm.csv")
+write.csv(norm_cpm_filtered, file = filtered_normalized_file, row.names = TRUE)
+write.table(norm_cpm_filtered, file = filtered_normalized_file, sep = "\t")
+
+```
+
+```{r Box Plots, tidy.opts=TRUE}
+
+knitr::include_graphics(file.path(diff_expr_directory, "cpm_counts_boxplot.png"))
+knitr::include_graphics(file.path(diff_expr_directory, "normalized_counts_boxplot.png"))
+knitr::include_graphics(file.path(diff_expr_directory, 
+                                  "filtered_normalized_counts_boxplot.png"))
+
+```
+
+## Visualize the data with MDS plots
+
+This section visualizes patterns and clustering in normalized and filtered data using MDS plots to identify potential outliers or groupings.
+
+### Normalized and filtered genes
+
+```{r MDS Plots, echo=TRUE}
+# Color palette
+mds_colors <- c("indianred1", "firebrick3", "lightskyblue", "royalblue")
+
+# Define combined factors for legend
+combined_factors <- interaction(metadata$Stage, metadata$Condition)
+
+# Modify legend labels: replace '.' with ' ' and capitalize words
+legend_labels <- levels(combined_factors)
+legend_labels <- gsub("\\.", " ", legend_labels)  # Replace period with space
+legend_labels <- tools::toTitleCase(legend_labels)  # Capitalize words
+
+# Assign colors and shapes based on combined factors
+legend_colors <- mds_colors[1:length(legend_labels)]
+colors <- mds_colors[as.numeric(combined_factors)]
+shapes <- ifelse(metadata$Replicate == 1, 16, 17)  # 16: filled circle, 17: filled triangle
+
+# Compute MDS coordinates for normalized data using edgeR's plotMDS
+mds_coords <- plotMDS(dge, plot=FALSE)
+
+# Determine axis limits to ensure labels fit within the plot
+xlim <- range(mds_coords$x) + c(-1, 2)
+ylim <- range(mds_coords$y) + c(-1, 1)
+
+# Extract eigenvalues and calculate percentage of variance explained
+percentage_variance <- 100 * mds_coords[["var.explained"]]
+
+# Plot MDS for normalized data
+mds_plot_path <- file.path(diff_expr_directory, "mds_normalized_variance.png")
+png(filename = mds_plot_path, width = 1920, height = 1080, res = 300)
+par(mar = c(5, 4, 4, 8) + 0.1)  # Adjust margins to make space for legend
+plot(mds_coords$x, mds_coords$y, col=colors, pch=shapes, cex=1.5,
+     main="MDS Plot of Normalized Data", 
+     sub="all genes",
+     xlab=paste("Dimension 1 (", round(percentage_variance[1], 2), "% Variance)", sep=""), 
+     ylab=paste("Dimension 2 (", round(percentage_variance[2], 2), "% Variance)", sep=""),
+     xlim=xlim, ylim=ylim)
+
+# Adding legend for Replicate 1 above the plot
+legend("topright", inset=c(-0.35, 0), 
+       legend=legend_labels, col=legend_colors, 
+       pch=16, title="Replicate 1", xpd=TRUE, cex=0.8)
+
+legend("bottomright", inset=c(-0.35, -0.1), 
+       legend=legend_labels, col=legend_colors, 
+       pch=17, title="Replicate 2", xpd=TRUE, cex=0.8)
+
+dev.off()
+
+# Compute MDS coordinates for normalized filtered data
+mds_coords_filtered <- plotMDS(dge_filtered, plot=FALSE)
+
+# Determine axis limits to ensure labels fit within the plot
+xlim_filtered <- range(mds_coords_filtered$x) + c(-1, 2)
+ylim_filtered <- range(mds_coords_filtered$y) + c(-1, 1)
+
+# Extract eigenvalues and calculate percentage of variance explained
+percentage_variance_filtered <- 100 * mds_coords_filtered[["var.explained"]]
+
+# Plot MDS for normalized filtered data
+mds_plot_filtered_path <- file.path(diff_expr_directory, "mds_filtered_normalized_variance.png")
+png(filename = mds_plot_filtered_path, width = 1920, height = 1080, res = 300)
+par(mar = c(5, 4, 4, 8) + 0.1)  # Adjust margins to make space for legend
+plot(mds_coords_filtered$x, mds_coords_filtered$y, col=colors, pch=shapes, cex=1.5,
+     main="MDS Plot of Normalized Filtered Data", 
+     sub="Genes with low expression omitted",
+     xlab=paste("Dimension 1 (", round(percentage_variance_filtered[1], 2), "% Variance)", sep=""), 
+     ylab=paste("Dimension 2 (", round(percentage_variance_filtered[2], 2), "% Variance)", sep=""),
+     xlim=xlim_filtered, ylim=ylim_filtered)
+
+# Adding legend for Replicates
+legend("topright", inset=c(-0.35, 0), 
+       legend=legend_labels, col=legend_colors, 
+       pch=16, title="Replicate 1", xpd=TRUE, cex=0.8)
+
+legend("bottomright", inset=c(-0.35, -0.1), 
+       legend=legend_labels, col=legend_colors, 
+       pch=17, title="Replicate 2", xpd=TRUE, cex=0.8)
+
+dev.off()
+
+```
+
+### Early stage only
+
+```{r Early MDS Plots, echo=TRUE}
+
+# Filter metadata for early stage samples
+metadata_early <- metadata[metadata$Stage == "early", ]
+
+# Filter data to include only early stage samples
+early_stage_dge <- dge[, rownames(metadata_early)]
+early_stage_dge_filtered <- dge_filtered[, rownames(metadata_early)]
+
+# Enhanced color palette for clarity
+palette <- c("indianred1", "lightskyblue")
+shapes <- ifelse(metadata_early$Replicate == 1, 16, 17)  
+  # 16: filled circle, 17: filled triangle
+
+# Define combined factors for legend (only early stage)
+combined_factors <- interaction(metadata_early$Stage, metadata_early$Condition)
+early_labels <- levels(combined_factors)
+early_colors <- palette[as.numeric(combined_factors)]
+
+# Compute MDS coordinates for normalized data using edgeR's plotMDS
+mds_coords_early <- plotMDS(early_stage_dge, plot=FALSE)
+
+# Extract eigenvalues and calculate percentage of variance explained
+percentage_variance_early <- 100 * mds_coords_early[["var.explained"]]
+
+# Determine axis limits to ensure labels fit within the plot
+xlim_early <- range(mds_coords_early$x) + c(-1, 1)
+ylim_early <- range(mds_coords_early$y) + c(-1, 1)
+
+# Plot MDS for normalized data
+png(filename = file.path(diff_expr_directory, "mds_earlynorm_variance.png"), 
+    width = 1920, height = 1080, res = 300)
+par(mar = c(5, 4, 4, 8) + 0.1)  # Adjust margins to make space for legend
+plot(mds_coords_early$x, mds_coords_early$y, col=early_colors, pch=shapes, cex=1.5,
+     main="MDS Plot of Early Stage Normalized Data", 
+     sub="all genes",
+     xlab=paste("Dimension 1 (", round(percentage_variance_early[1], 2), "% Variance)", sep=""), 
+     ylab=paste("Dimension 2 (", round(percentage_variance_early[2], 2), "% Variance)", sep=""),
+     xlim=xlim_early, ylim=ylim_early)
+
+# Adding legend for Replicate 1 above the plot
+legend("topright", inset=c(-0.35, 0), 
+       legend=early_labels, col=palette, pch=16, 
+       title="Replicate 1", xpd=TRUE, cex=0.8)
+
+# Adding legend for Replicate 2 below the plot
+legend("bottomright", inset=c(-0.35, 0), 
+       legend=early_labels, col=palette, pch=17, 
+       title="Replicate 2", xpd=TRUE, cex=0.8)
+
+dev.off()
+
+# Compute MDS coordinates for normalized filtered data using edgeR's plotMDS
+mds_coords_early_filtered <- plotMDS(early_stage_dge_filtered, plot=FALSE)
+
+# Extract eigenvalues and calculate percentage of variance explained
+percentage_variance_early_filtered <- 100 * mds_coords_early_filtered[["var.explained"]]
+
+# Determine axis limits to ensure labels fit within the plot
+xlim_early_filtered <- range(mds_coords_early_filtered$x) + c(-1, 1)
+ylim_early_filtered <- range(mds_coords_early_filtered$y) + c(-1, 1)
+
+# Plot MDS for normalized filtered data
+png(filename = file.path(diff_expr_directory, "mds_earlynorm_filt_variance.png"), 
+    width = 1920, height = 1080, res = 300)
+par(mar = c(5, 4, 4, 8) + 0.1)  # Adjust margins to make space for legend
+plot(mds_coords_early_filtered$x, mds_coords_early_filtered$y, col=early_colors, pch=shapes, cex=1.5,
+     main="MDS Plot of Early Stage Normalized Filtered Data", 
+     sub="genes with low expression omitted",
+     xlab=paste("Dimension 1 (", round(percentage_variance_early_filtered[1], 2), "% Variance)", sep=""), 
+     ylab=paste("Dimension 2 (", round(percentage_variance_early_filtered[2], 2), "% Variance)", sep=""),
+     xlim=xlim_early_filtered, ylim=ylim_early_filtered)
+
+# Adding legend for Replicate 1 above the plot
+legend("topright", inset=c(-0.35, 0), 
+       legend=early_labels, col=palette, pch=16, 
+       title="Replicate 1", xpd=TRUE, cex=0.8)
+
+# Adding legend for Replicate 2 below the plot
+legend("bottomright", inset=c(-0.35, 0), 
+       legend=early_labels, col=palette, pch=17, 
+       title="Replicate 2", xpd=TRUE, cex=0.8)
+
+dev.off()
+
+```
+
+### Genes with the most variance
+
+```{r Top Genes, echo=TRUE}
+
+# Calculate variance for each gene
+gene_variances <- apply(dge$counts, 1, var)
+
+# Select the top N genes based on variance
+topN <- 100  # You can adjust this number based on your preference
+top_genes <- order(gene_variances, decreasing = TRUE)[1:topN]
+
+# Subset the DGEList object to include only the top genes
+dge_top_genes <- dge[top_genes, ]
+
+# Compute MDS coordinates for top genes using edgeR's plotMDS
+mds_coords_top <- plotMDS(dge_top_genes, plot=FALSE)
+
+# Determine axis limits to ensure labels fit within the plot
+xlim_top <- range(mds_coords_top$x) + c(-1, 2)
+ylim_top <- range(mds_coords_top$y) + c(-1, 1)
+
+# Extract eigenvalues and calculate percentage of variance explained
+percentage_variance_top <- 100 * mds_coords_top[["var.explained"]]
+
+# Plot MDS for top genes
+mds_plot_top_path <- file.path(diff_expr_directory, "mds_top_genes.png")
+png(filename = mds_plot_top_path, width = 1920, height = 1080, res = 300)
+par(mar = c(5, 4, 4, 8) + 0.1)  # Adjust margins to make space for legend
+plot(mds_coords_top$x, mds_coords_top$y, col=colors, pch=shapes, cex=1.5,
+     main="MDS Plot of Top Genes", 
+     sub=paste("Top", topN, "genes based on variance"),
+     xlab=paste("Dimension 1 (", round(percentage_variance_top[1], 2), "% Variance)", sep=""), 
+     ylab=paste("Dimension 2 (", round(percentage_variance_top[2], 2), "% Variance)", sep=""),
+     xlim=xlim_top, ylim=ylim_top)
+
+# Adding legend for replicates
+legend("topright", inset=c(-0.35, 0), 
+       legend=legend_labels, col=legend_colors, 
+       pch=16, title="Replicate 1", xpd=TRUE, cex=0.8)
+
+legend("bottomright", inset=c(-0.35, -0.1), 
+       legend=legend_labels, col=legend_colors, 
+       pch=17, title="Replicate 2", xpd=TRUE, cex=0.8)
+
+dev.off()
+
+```
+
+```{r MDS embed}
+knitr::include_graphics(file.path(diff_expr_directory, 
+                                  "mds_normalized_variance.png"))
+knitr::include_graphics(file.path(diff_expr_directory, 
+                                  "mds_filtered_normalized_variance.png"))
+knitr::include_graphics(file.path(diff_expr_directory, 
+                                  "mds_earlynorm_variance.png"))
+knitr::include_graphics(file.path(diff_expr_directory, 
+                                  "mds_earlynorm_filt_variance.png"))
+knitr::include_graphics(file.path(diff_expr_directory,
+                                  "mds_top_genes.png"))
+
+```
+
+# Differential expression using limma and voom
+
+Differential gene expression is utilized to determine the genes that are up-regulated and down regulated in the damaged condition.
+
+## DEG analysis
+
+This section performs differential gene expression analysis using limma and voom, fitting the model and defining contrasts.
+
+```{r voom, echo=TRUE}
+# Define the group and model matrix
+group <- factor(paste(metadata$Stage, 
+                      metadata$Condition, 
+                      sep = "_"))
+model_matrix <- model.matrix(~0 + group)
+
+# Replace colons with underscores in the design matrix
+colnames(model_matrix) <- gsub(":", "_", colnames(model_matrix))
+
+# Apply voom transformation and save the plot
+voom_path <- file.path(diff_expr_directory, "voom_plot.png")
+png(filename = voom_path, width = 1920, height = 1080, res = 300)
+v <- voom(dge_filtered, model_matrix, plot = TRUE)
+dev.off()
+
+knitr::include_graphics(file.path(diff_expr_directory, "voom_plot.png"))
+```
+
+```{r DEG Analysis, message=FALSE, warning=FALSE}
+
+# Fit the linear model
+fit <- lmFit(v, model_matrix)
+
+# Specify contrasts or comparisons
+contrast.matrix <- makeContrasts(
+  Damaged_EarlyvsLate = groupearly_damaged - grouplate_damaged, 
+  Undamaged_EarlyvsLate = groupearly_undamaged - grouplate_undamaged,
+  Early_DamagedvsUndamaged = groupearly_damaged - groupearly_undamaged,
+  Late_DamagedvsUndamaged = grouplate_damaged - grouplate_undamaged,
+  levels = model_matrix
+  )
+
+# Apply contrasts to fit
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# Apply modeling to get differential expression genes
+# Set an adjusted p-value and log fold change cutoff
+dt_BH <- decideTests(fit2, adjust.method = "BH", p.value = 0.05, lfc = 2)
+summary(dt_BH)
+
+# Define contrast names for saving files
+contrast_names <- c("Damaged_EarlyvsLate", "Undamaged_EarlyvsLate", 
+                    "Early_DamagedvsUndamaged", "Late_DamagedvsUndamaged")
+
+# Initialize lists to store results for each contrast
+contrast_results <- list()
+
+# Calculate stats for each contrast and save results
+for (contrast in contrast_names) {
+  contrast_results[[contrast]] <- topTable(fit2, coef = contrast, 
+                                           adjust.method = "BH", number = Inf)
+  
+  # Save results to a TSV file
+  results_path <- file.path(diff_expr_directory, paste0(contrast, "_results.tsv"))
+  write.table(contrast_results[[contrast]], file = results_path, sep = "\t", 
+              row.names = TRUE)
+}
+```
+
+```{r Convert IDs, message=FALSE, warning=FALSE}
+
+# Define function to convert FlyBase gene IDs to gene names using biomaRt
+convert_gene_ids_to_names <- function(df, mart, id_column="genes") {
+  gene_ids <- df[[id_column]]
+  gene_mapping <- getBM(filters = "flybase_gene_id", 
+                        attributes = c("flybase_gene_id", "external_gene_name"), 
+                        values = gene_ids, 
+                        mart = mart)
+  # Merge the gene names into the original dataframe
+  df$genes <- gene_mapping$external_gene_name[match(df$genes, gene_mapping$flybase_gene_id)]
+  return(df)
+}
+
+# Apply the function to each contrast result
+mart <- useMart("ensembl", dataset = "dmelanogaster_gene_ensembl")
+for (contrast in contrast_names) {
+  contrast_results[[contrast]] <- convert_gene_ids_to_names(contrast_results[[contrast]], mart, id_column = "genes")
+  
+  # Save the updated result with gene names
+  results_path <- file.path(diff_expr_directory, paste0(contrast, "_results_with_genes.tsv"))
+  write.table(contrast_results[[contrast]], file = results_path, sep = "\t", row.names = TRUE)
+}
+```
+
+```{r Up- and Down-regulated}
+# Extract up- and down-regulated genes for early and late stages
+early_results <- contrast_results[["Early_DamagedvsUndamaged"]]
+late_results <- contrast_results[["Late_DamagedvsUndamaged"]]
+
+# Early stage: Upregulated and downregulated
+early_upregulated <- early_results[early_results$logFC >= 2 & 
+                                     early_results$adj.P.Val <= 0.05, 
+                                   c("genes", "logFC", "adj.P.Val")]
+early_downregulated <- early_results[early_results$logFC <= -2 & 
+                                       early_results$adj.P.Val <= 0.05, 
+                                     c("genes", "logFC", "adj.P.Val")]
+
+# Late stage: Upregulated and downregulated
+late_upregulated <- late_results[late_results$logFC >= 2 & 
+                                   late_results$adj.P.Val <= 0.05, 
+                                 c("genes", "logFC", "adj.P.Val")]
+late_downregulated <- late_results[late_results$logFC <= -2 & 
+                                     late_results$adj.P.Val <= 0.05, 
+                                   c("genes", "logFC", "adj.P.Val")]
+
+# Add gene ids as a column
+early_upregulated$gene_id <- rownames(early_upregulated)
+early_downregulated$gene_id <- rownames(early_downregulated)
+late_upregulated$gene_id <- rownames(late_upregulated)
+late_downregulated$gene_id <- rownames(late_downregulated)
+
+# Save gene lists as TSV files
+write.table(early_upregulated, 
+            file = file.path(diff_expr_directory, "early_upregulated_genes.tsv"), 
+            sep = "\t", row.names = FALSE, col.names = TRUE)
+write.table(early_downregulated, 
+            file = file.path(diff_expr_directory, "early_downregulated_genes.tsv"), 
+            sep = "\t", row.names = FALSE, col.names = TRUE)
+write.table(late_upregulated, 
+            file = file.path(diff_expr_directory, "late_upregulated_genes.tsv"), 
+            sep = "\t", row.names = FALSE, col.names = TRUE)
+write.table(late_downregulated, 
+            file = file.path(diff_expr_directory, "late_downregulated_genes.tsv"), 
+            sep = "\t", row.names = FALSE, col.names = TRUE)
+```
+
+## Volcano Plots
+
+```{r JAKSTAT-JNK}
+# Create JAKSTAT and JNK data as data frames
+jakstat_data <- data.frame(
+  ID = c('FBgn0004956', 'FBgn0030904', 'FBgn0053542', 'FBgn0016917',
+                 'FBgn0004864', 'FBgn0043903', 'FBgn0041184', 'FBgn0036690',
+                 'FBgn0001078', 'FBgn0086758', 'FBgn0267487', 'FBgn0052475',
+                 'FBgn0011236', 'FBgn0015903', 'FBgn0031055', 'FBgn0014018',
+                 'FBgn0033266'),
+  GENE = c('upd1', 'upd2', 'upd3', 'Stat92E', 
+                   'hop', 'dome', 'Socs36E', 'Ilp8',
+                   'ftz-f1', 'chinmo', 'Ptp61F', 'mthl8',
+                   'ken', 'apt', 'et', 'rel',
+                   'Socs44A')
+)
+
+jnk_data <- data.frame(
+  ID = c('FBgn0033483', 'FBgn0001291', 'FBgn0001297', 'FBgn0010909',
+             'FBgn0010303', 'FBgn0000229', 'FBgn0030941', 'FBgn0032682',
+             'FBgn0024326', 'FBgn0026323', 'FBgn0261524', 'FBgn0243512', 
+             'FBgn0035049', 'FBgn0284084', 'FBgn0031089', 'FBgn0259977',
+             'FBgn0050446'),
+  GENE = c('egr', 'jra', 'kay', 'msn',
+               'hep', 'bsk', 'wgn', 'grnd',
+               'Mkk4', 'Tak1', 'lic', 'puc', 
+               'Mmp1', 'wg', 'aspr', 'tdc1', 
+               'tdc2')
+)
+
+# View each data frame
+print(jakstat_data)
+print(jnk_data)
+```
+
+```{r Volcano Plots}
+# Generate volcano plots for each contrast
+for (contrast in contrast_names) {
+  results <- contrast_results[[contrast]]
+  
+  # Determine the maximum y value for the y-axis limit
+  max_y_value <- max(-log10(results$adj.P.Val), na.rm = TRUE)
+  ylim_value <- ceiling(max_y_value) + 0.25
+  
+  # Prepare shapes for up- and down-regulated genes
+  shapes <- ifelse(
+    results$logFC > 0, 24,
+    ifelse(results$logFC < 0, 25, 20))
+  names(shapes)[shapes == 20] <- "No change"
+  names(shapes)[shapes == 24] <- "Upregulated"
+  names(shapes)[shapes == 25] <- "Downregulated"
+  
+  # Prepare colors for symbols
+  shape_colors <- ifelse(
+    abs(results$logFC) > 2.0 & results$adj.P.Val < 0.05,
+    ifelse(results$logFC < -2.0, "blue",
+           ifelse(results$logFC > 2.0, "red2", "azure4")), "azure4")
+
+  names(shape_colors)[shape_colors == "blue"] <- "Significant Downregulation"
+  names(shape_colors)[shape_colors == "red2"] <- "Significant Upregulation"
+  names(shape_colors)[shape_colors == "azure4"] <- "Not Significant"
+  
+  # Highlight JAK/STAT genes
+  jakstat_labels <- ifelse(results$genes %in% jakstat_data$GENE, 
+                           results$genes, NA)
+
+  # Create the volcano plot and assign to variable
+  volcano_plot <- EnhancedVolcano(results,
+                                  lab = results$genes,
+                                  x = 'logFC',
+                                  y = 'adj.P.Val',
+                                  selectLab = jakstat_labels,
+                                  pCutoff = 0.05,
+                                  FCcutoff = 2.0,
+                                  ylim = c(0, ylim_value),
+                                  title = paste('Volcano Plot:', 
+                                                gsub("_", " ", contrast)),
+                                  legendPosition = 'right',
+                                  shapeCustom = shapes,
+                                  colCustom = shape_colors,
+                                  drawConnectors = TRUE, 
+                                  maxoverlapsConnectors = Inf,
+                                  max.overlaps = Inf)
+
+  # Path to save the plot
+  volcano_path <- file.path(diff_expr_directory, paste0(contrast, "_volcano.png"))
+  
+  # Save to PNG
+  png(volcano_path, width = 2200, height = 1920, res = 300)
+  print(volcano_plot)
+  dev.off()
+}
+```
+
+```{r Embed VolcanoPlots}
+
+knitr::include_graphics(file.path(diff_expr_directory, 
+                                  "Early_DamagedvsUndamaged_volcano.png"))
+knitr::include_graphics(file.path(diff_expr_directory, 
+                                  "Late_DamagedvsUndamaged_volcano.png"))
+```
+
+## Scatter Plots
+
+```{r JAKSTAT Scatter}
+# Extract coefficients and statistics from the fit2 object
+coefficients <- coef(fit2)
+
+# If coefficients are already in linear scale, use them directly
+fold_changes <- coefficients
+
+# Create a data frame for plotting
+plot_data <- data.frame(
+  Early_L3 = fold_changes[, "Early_DamagedvsUndamaged"],
+  Late_L3 = fold_changes[, "Late_DamagedvsUndamaged"],
+  Gene_ID = rownames(fold_changes)
+)
+
+# Ensure Gene_ID and JAKSTAT_GENE are correctly matched
+jakstat_gene_ids <- jakstat_data$ID
+jnk_gene_ids <- jnk_data$ID
+
+# Filter based on significant fold changes OR if it is a JAK/STAT gene
+plot_data_filtered <- plot_data %>%
+  filter(abs(Early_L3) >= 2 | abs(Late_L3) >= 2 | Gene_ID %in% jakstat_gene_ids |
+  Gene_ID %in% jnk_gene_ids)
+
+# Create a column for labeling based on jakstat_genes
+plot_data_filtered$label <- ifelse(plot_data_filtered$Gene_ID %in% jakstat_data$ID, 
+                                   jakstat_data$GENE[match(plot_data_filtered$Gene_ID,
+                                                           jakstat_data$ID)], NA)
+
+# Early L3 on X-axis; Late L3 on Y-axis
+jakstat_plot <- ggplot(plot_data_filtered, 
+                       aes(x = Early_L3, y = Late_L3, label = label)) +
+  geom_point(alpha = 0.5, color = "grey") +
+  geom_point(data = plot_data_filtered[!is.na(plot_data_filtered$label), ], 
+             aes(color = "red"), size = 1) +
+  geom_text_repel(size = 3, color = "black", max.overlaps = 20) +
+  labs(x = "Early L3 (Log2FC)",
+       y = "Late L3 (Log2FC)",
+       title = "Log Fold Change Comparison of Early vs Late L3 Stages\nwith Highlighted JAK/STAT Genes") +
+  theme_minimal()
+
+# Save Plot as a PNG
+jakstat_scatter_file <- file.path(diff_expr_directory, "jakstat_scatter.png")
+ggsave(jakstat_scatter_file, plot = jakstat_plot, width = 6, height = 4, dpi = 300)
+
+# Print the plot
+print(jakstat_plot)
+```
+
+```{r JNK Scatter}
+# Create a column for labeling based on jnk_genes
+plot_data_filtered$label2 <- ifelse(plot_data_filtered$Gene_ID %in% jnk_data$ID, 
+                                   jnk_data$GENE[match(plot_data_filtered$Gene_ID,
+                                                       jnk_data$ID)], NA)
+
+# Early L3 on X-axis; Late L3 on Y-axis
+jnk_plot <- ggplot(plot_data_filtered, aes(x = Early_L3, 
+                           y = Late_L3, 
+                           label = label2)) +
+  geom_point(alpha = 0.5, color = "grey") +
+  geom_point(data = plot_data_filtered[!is.na(plot_data_filtered$label2), ], 
+             aes(color = "red"), size = 1) +
+  geom_text_repel(size = 3, color = "black", max.overlaps = 20) +
+  labs(x = "Early L3 (Log2FC)",
+       y = "Late L3 (Log2FC)",
+       title = "Log Fold Change Comparison of Early vs Late L3 Stages\nwith Highlighted JNK Pathway Genes") +
+  theme_minimal()
+
+# Save Plot as a PNG
+jnk_scatter_file <- file.path(diff_expr_directory, "jnk_scatter.png")
+ggsave(jnk_scatter_file, plot = jnk_plot, width = 6, height = 4, dpi = 300)
+
+# Print the plot
+print(jnk_plot)
+```
+
+```{r Combined Scatter}
+# Combine counts for both JAK/STAT and JNK genes
+jakjnk_data <- rbind(jakstat_data, jnk_data)
+
+# Create a column for labeling based on combined jakjnk_genes
+plot_data_filtered$label3 <- ifelse(plot_data_filtered$Gene_ID %in% jakjnk_data$ID, 
+                                   jakjnk_data$GENE[match(plot_data_filtered$Gene_ID,
+                                                          jakjnk_data$ID)], NA)
+
+# Early L3 on X-axis; Late L3 on Y-axis
+jakjnk_plot <- ggplot(plot_data_filtered, aes(x = Early_L3, 
+                           y = Late_L3, 
+                           label = label3)) +
+  geom_point(alpha = 0.5, color = "grey") +
+  geom_point(data = plot_data_filtered[!is.na(plot_data_filtered$label3), ], 
+             aes(color = "red"), size = 1) +
+  geom_text_repel(size = 3, color = "black", max.overlaps = 30) +
+  labs(x = "Early L3 (Log2FC)",
+       y = "Late L3 (Log2FC)",
+       title = "Log Fold Change Comparison of Early vs Late L3 Stages\nwith Highlighted JAK/STAT and JNK Pathway Genes") +
+  theme_minimal()
+
+# Save Plot as a PNG
+jakjnk_scatter_file <- file.path(diff_expr_directory, "jakjnk_scatter.png")
+ggsave(jakjnk_scatter_file, plot = jakjnk_plot, width = 6, height = 4, dpi = 300)
+
+# Print the plot
+print(jakjnk_plot)
+```
+
+## Upset Plot
+
+```{r Preparing UpSet}
+# Convert row names (gene_id) to a proper column in early_results
+early_results$gene_id <- rownames(early_results)
+late_results$gene_id <- rownames(late_results)
+
+# Create binary columns for the presence of each gene in the specific condition
+early_upregulated$up_early <- 1
+early_downregulated$down_early <- 1
+late_upregulated$up_late <- 1
+late_downregulated$down_late <- 1
+
+# Use early_results as the master data frame containing all genes
+master_genes <- early_results[, c("gene_id", "genes")]
+
+# Merge all data frames onto the master_genes data frame
+combined_regulation <- merge(master_genes, 
+                             early_upregulated[, c("gene_id", "up_early")], 
+                             by = "gene_id", all.x = TRUE)
+combined_regulation <- merge(combined_regulation, 
+                             early_downregulated[, c("gene_id", "down_early")], 
+                             by = "gene_id", all.x = TRUE)
+combined_regulation <- merge(combined_regulation, 
+                             late_upregulated[, c("gene_id", "up_late")], 
+                             by = "gene_id", all.x = TRUE)
+combined_regulation <- merge(combined_regulation, 
+                             late_downregulated[, c("gene_id", "down_late")], 
+                             by = "gene_id", all.x = TRUE)
+
+# Replace NA with 0 to indicate genes not present in a particular condition
+combined_regulation[is.na(combined_regulation)] <- 0
+
+# Remove rows where all values in the binary columns are 0
+binary_columns <- c("up_early", "down_early", "up_late", "down_late")
+
+# Filter the rows where the sum across the binary columns is greater than 0
+combined_regulation <- combined_regulation[rowSums(
+  combined_regulation[, binary_columns]) > 0, ]
+
+# Verify the filtered combined regulation data
+head(combined_regulation)
+```
+
+```{r Early-Late Upset}
+# Define labels for the UpSet plot
+set_labels <- c("Upregulated in Early Stage", 
+                "Downregulated in Early Stage", 
+                "Upregulated in Late Stage", 
+                "Downregulated in Late Stage")
+
+# Rename the columns in combined_regulation to match the labels
+colnames(combined_regulation) <- c("gene_id", "gene", set_labels)
+
+# Define custom colors for each set
+set_colors <- c("firebrick3", "royalblue", "indianred1", "lightskyblue")
+
+# Create and save the UpSet plot
+subset_upset <- file.path(diff_expr_directory, "upset_plot.png")
+png(subset_upset, width = 1920, height = 1920, res = 300)
+upset(combined_regulation, 
+      sets = set_labels, 
+      order.by = "freq",   # Sort by the number of genes
+      keep.order = FALSE,  
+      mainbar.y.label = "Genes per group", 
+      sets.x.label = "Genes per contrast", 
+      point.size = 2, 
+      line.size = 1, 
+      sets.bar.color = set_colors)
+dev.off()
+
+# Embed the plot in the report
+knitr::include_graphics(subset_upset)
+```
+
+```{r Gene Groups}
+# Create a new column-based data frame where each gene belongs to one group (binary: 1 or 0)
+
+# Start by creating an empty data frame to store the group membership
+gene_groups <- data.frame(
+  gene_id = combined_regulation$gene_id,
+  gene = combined_regulation$gene,
+  upregulated_in_early_damaged = 0,
+  downregulated_in_early_damaged = 0,
+  upregulated_in_late_damaged = 0,
+  downregulated_in_late_damaged = 0,
+  upregulated_in_early_and_late = 0,
+  downregulated_in_early_and_late = 0,
+  downregulated_in_late_upregulated_in_early = 0,
+  upregulated_in_late_downregulated_in_early = 0
+)
+
+# Fill in the group columns with 1 where conditions are met, ensuring only one group per gene is filled
+gene_groups$upregulated_in_early_damaged[
+  combined_regulation$`Upregulated in Early Stage` == 1 &
+  combined_regulation$`Downregulated in Early Stage` == 0 &
+  combined_regulation$`Upregulated in Late Stage` == 0 &
+  combined_regulation$`Downregulated in Late Stage` == 0] <- 1
+
+gene_groups$downregulated_in_early_damaged[
+  combined_regulation$`Downregulated in Early Stage` == 1 &
+  combined_regulation$`Upregulated in Early Stage` == 0 &
+  combined_regulation$`Upregulated in Late Stage` == 0 &
+  combined_regulation$`Downregulated in Late Stage` == 0] <- 1
+
+gene_groups$upregulated_in_late_damaged[
+  combined_regulation$`Upregulated in Late Stage` == 1 &
+  combined_regulation$`Downregulated in Early Stage` == 0 &
+  combined_regulation$`Upregulated in Early Stage` == 0 &
+  combined_regulation$`Downregulated in Late Stage` == 0] <- 1
+
+gene_groups$downregulated_in_late_damaged[
+  combined_regulation$`Downregulated in Late Stage` == 1 &
+  combined_regulation$`Upregulated in Early Stage` == 0 &
+  combined_regulation$`Downregulated in Early Stage` == 0 &
+  combined_regulation$`Upregulated in Late Stage` == 0] <- 1
+
+gene_groups$upregulated_in_early_and_late[
+  combined_regulation$`Upregulated in Early Stage` == 1 &
+  combined_regulation$`Upregulated in Late Stage` == 1 &
+  combined_regulation$`Downregulated in Early Stage` == 0 &
+  combined_regulation$`Downregulated in Late Stage` == 0] <- 1
+
+gene_groups$downregulated_in_early_and_late[
+  combined_regulation$`Downregulated in Early Stage` == 1 &
+  combined_regulation$`Downregulated in Late Stage` == 1 &
+  combined_regulation$`Upregulated in Early Stage` == 0 &
+  combined_regulation$`Upregulated in Late Stage` == 0] <- 1
+
+gene_groups$downregulated_in_late_upregulated_in_early[
+  combined_regulation$`Downregulated in Late Stage` == 1 &
+  combined_regulation$`Upregulated in Early Stage` == 1 &
+  combined_regulation$`Downregulated in Early Stage` == 0 &
+  combined_regulation$`Upregulated in Late Stage` == 0] <- 1
+
+gene_groups$upregulated_in_late_downregulated_in_early[
+  combined_regulation$`Upregulated in Late Stage` == 1 &
+  combined_regulation$`Downregulated in Early Stage` == 1 &
+  combined_regulation$`Upregulated in Early Stage` == 0 &
+  combined_regulation$`Downregulated in Late Stage` == 0] <- 1
+
+# Check if any genes belong to multiple groups (for validation)
+duplicates <- rowSums(gene_groups[, 3:10]) > 1
+if (any(duplicates)) {
+  warning("Some genes belong to more than one group.")
+} else {
+  message("All genes have been correctly assigned to one group.")
+}
+
+# Inspect the resulting data frame
+head(gene_groups)
+```
+
+```{r Create Spreadsheet}
+# Create a new workbook
+wb <- createWorkbook()
+
+# Function to convert snake_case to Title Case with spaces
+convert_to_title_case <- function(name) {
+  # Convert underscores to spaces and capitalize each word
+  name <- gsub("_", " ", name)  # Replace underscores with spaces
+  name <- tools::toTitleCase(name)  # Convert to title case
+  
+  # Truncate the name if it's longer than 31 characters
+  if (nchar(name) > 31) {
+    name <- substr(name, 1, 31)  # Keep only the first 31 characters
+  }
+  
+  return(name)
+}
+
+
+# Loop through each column of the gene_groups data frame and extract data
+for (group_name in names(gene_groups)[-c(1,2)]) {  # Skip gene_id and gene
+  # Extract gene_ids for this group
+  gene_ids <- gene_groups$gene_id[gene_groups[[group_name]] == 1]
+  
+  # Match gene_ids with early_results and late_results
+  early_late_data <- data.frame(
+    Gene_ID = gene_ids,
+    Gene = combined_regulation$gene[match(gene_ids, combined_regulation$gene_id)],
+    logFC_Early = early_results$logFC[match(gene_ids, early_results$gene_id)],
+    adj_pval_Early = early_results$adj.P.Val[match(gene_ids, early_results$gene_id)],
+    pval_Early = early_results$P.Value[match(gene_ids, early_results$gene_id)],
+    tstat_Early = early_results$t[match(gene_ids, early_results$gene_id)],
+    bstat_Early = early_results$B[match(gene_ids, early_results$gene_id)],
+    logFC_Late = late_results$logFC[match(gene_ids, late_results$gene_id)],
+    adj_pval_Late = late_results$adj.P.Val[match(gene_ids, late_results$gene_id)],
+    pval_Late = late_results$P.Value[match(gene_ids, late_results$gene_id)],
+    tstat_Late = late_results$t[match(gene_ids, late_results$gene_id)],
+    bstat_Late = late_results$B[match(gene_ids, late_results$gene_id)]
+  )
+  
+  # Convert the sheet name to Title Case with spaces
+  sheet_name <- convert_to_title_case(group_name)
+  
+  # Add a new worksheet with the formatted name
+  addWorksheet(wb, sheet_name)
+  
+  # Write the early_late_data to the corresponding sheet
+  writeData(wb, sheet = sheet_name, early_late_data)
+}
+
+# Define the output Excel file path
+output_excel_path <- file.path(diff_expr_directory, "Upset_GeneGroups.xlsx")
+
+# Save the workbook to an Excel file
+saveWorkbook(wb, output_excel_path, overwrite = TRUE)
+
+# Confirm message
+cat("Excel file with gene groups and stats has been saved in", output_excel_path)
+```
+
+## Heat map of JAK/STAT Pathway Genes
+
+```{r Heat Map Prep}
+# Create sample labels based on Condition, Stage, and Replicate
+sample_conditions <- metadata$Condition
+sample_stages <- metadata$Stage
+sample_replicates <- paste0("Rep_", metadata$Replicate)
+
+# Combine the annotations into a data frame
+sample_annotations <- data.frame(Condition = sample_conditions,
+                                 Stage = sample_stages,
+                                 Replicate = sample_replicates)
+rownames(sample_annotations) <- rownames(metadata)
+
+# Define color-blind friendly color list for each annotation
+color_list <- list(Condition = c(undamaged = "#56B4E9", damaged = "#E69F00"),
+                   Stage = c(early = "#F0E442", late = "#009E73"),
+                   Replicate = c(Rep_1 = "#0072B2", Rep_2 = "#D55E00"))
+```
+
+```{r JAKSTAT Heat Map, echo=TRUE}
+# Subset counts or normalized counts for JAK-STAT genes
+jakstat_counts <- norm_cpm_filtered[jakstat_data$ID, ]
+
+# Rename rows using the gene names
+rownames(jakstat_counts) <- jakstat_data$GENE
+
+# Create a heatmap using ComplexHeatmap with annotations
+heatmap_obj <- Heatmap(jakstat_counts,
+                       name = "Expression Level",
+                       cluster_rows = TRUE,  # Clustering on the left
+                       show_row_dend = TRUE,  # Show row dendrogram
+                       cluster_columns = FALSE,  # No clustering for samples
+                       show_row_names = TRUE,
+                       row_names_side = "right",  # Show gene names on the right
+                       column_title = "JAK/STAT Pathway Genes",
+                       show_column_names = FALSE,
+                       row_names_gp = gpar(fontsize = 8),
+                       column_names_gp = gpar(fontsize = 10),
+                       top_annotation = HeatmapAnnotation(df = sample_annotations,
+                                                          col = color_list))
+
+# Save the heatmap
+heatmap_file <- file.path(diff_expr_directory, "JAKSTAT_heatmap.png")
+png(filename = heatmap_file, width = 1600, height = 1200, res = 300)  # Adjust width and height as needed
+print(heatmap_obj)
+dev.off()
+
+plot(heatmap_obj)
+```
+
+```{r JNK Heat Map}
+# Subset counts or normalized counts for JNK genes
+jnk_counts <- norm_cpm_filtered[jnk_data$ID, ]
+
+# Rename rows using the gene names
+rownames(jnk_counts) <- jnk_data$GENE
+
+# Create a heatmap for JNK genes
+heatmap_obj_jnk <- Heatmap(jnk_counts,
+                           name = "Expression Level",
+                           cluster_rows = TRUE,  # Clustering on the left
+                           show_row_dend = TRUE,  # Show row dendrogram
+                           cluster_columns = FALSE,  # No clustering for samples
+                           show_row_names = TRUE,
+                           row_names_side = "right",  # Show gene names on the right
+                           column_title = "JNK Pathway Genes",
+                           show_column_names = FALSE,
+                           row_names_gp = gpar(fontsize = 8),
+                           column_names_gp = gpar(fontsize = 10),
+                           top_annotation = HeatmapAnnotation(df = sample_annotations,
+                                                              col = color_list))
+
+# Save the heatmap for JNK genes
+heatmap_file_jnk <- file.path(diff_expr_directory, "JNK_heatmap.png")
+png(filename = heatmap_file_jnk, width = 1600, height = 1200, res = 300)
+print(heatmap_obj_jnk)
+dev.off()
+
+# Optionally plot it directly in the R environment
+plot(heatmap_obj_jnk)
+```
+
+```{r Combined Heat Map}
+# Subset the counts for the combined gene list
+combined_counts <- norm_cpm_filtered[jakjnk_data$ID, ]
+
+# Rename rows using the combined gene names
+rownames(combined_counts) <- jakjnk_data$GENE
+
+# Create a heatmap for both JAK/STAT and JNK genes
+heatmap_obj_combined <- Heatmap(combined_counts,
+                                name = "Expression Level",
+                                cluster_rows = TRUE,  # Clustering on the left
+                                show_row_dend = TRUE,  # Show row dendrogram
+                                cluster_columns = FALSE,  # No clustering for samples
+                                show_row_names = TRUE,
+                                row_names_side = "right",  # Show gene names on the right
+                                column_title = "Combined JAK/STAT and JNK Pathway Genes",
+                                show_column_names = FALSE,
+                                row_names_gp = gpar(fontsize = 8),
+                                column_names_gp = gpar(fontsize = 10),
+                                top_annotation = HeatmapAnnotation(df = sample_annotations,
+                                                                   col = color_list))
+
+# Save the combined heatmap
+heatmap_file_combined <- file.path(diff_expr_directory, "JAKSTAT_JNK_heatmap.png")
+png(filename = heatmap_file_combined, width = 2000, height = 1200, res = 300)
+print(heatmap_obj_combined)
+dev.off()
+
+plot(heatmap_obj_combined)
+```
+
+## Venn Diagram
+
+```{r}
+# First, rename the columns in early and late results to distinguish between them
+early_results <- early_results %>%
+  rename(early_logFC = logFC, early_adj.P.Val = adj.P.Val)
+
+late_results <- late_results %>%
+  rename(late_logFC = logFC, late_adj.P.Val = adj.P.Val)
+
+# Merge jakjnk_data with early and late results based on gene ID
+jakjnk_data <- jakjnk_data %>%
+  left_join(early_results, by = c("ID" = "gene_id")) %>%
+  left_join(late_results, by = c("ID" = "gene_id"))
+
+# Add a column indicating the pathway
+jakjnk_data <- jakjnk_data %>%
+  mutate(Pathway = ifelse(GENE %in% jakstat_data$GENE, "JAK/STAT", "JNK")) %>%
+  dplyr::select(ID, GENE, Pathway, early_logFC, early_adj.P.Val, late_logFC, late_adj.P.Val)
+
+# View the updated jak-jnk_data
+head(jakjnk_data)
+```
+
+```{r Up-regulated Venn Diagram}
+# Create Venn diagram in memory (without directly saving it)
+up_venn <- venn.diagram(
+  x = list(
+    Early_Upregulated = early_upregulated$genes,
+    Late_Upregulated = late_upregulated$genes
+  ),
+  category.names = c("Early Upregulated", "Late Upregulated"),
+  filename = NULL,  # Do not save immediately
+  output = TRUE,
+  imagetype = "png",
+  height = 3000, width = 3250, resolution = 300,
+  lwd = 2,
+  fill = c("#56B4E9", "#E69F00"),
+  alpha = 0.5,
+  cex = 5,  # Increase font size of the numbers
+  cat.cex = 2,  # Increase font size of the category names
+  cat.pos = c(-15, 15),
+  cat.dist = 0.05,
+  euler.d = TRUE,
+  scaled = TRUE
+)
+
+# Render the Venn diagram on the grid
+grid.draw(up_venn)
+
+# Find JAK/STAT genes in each category
+upregulated_early_jakstat <- intersect(early_upregulated$gene_id, jakjnk_data$ID)
+upregulated_late_jakstat <- intersect(late_upregulated$gene_id, jakjnk_data$ID)
+
+# Count JAK/STAT genes in each section of the up-regulated Venn diagram
+up_early_only_jakstat <- setdiff(upregulated_early_jakstat, upregulated_late_jakstat)
+up_late_only_jakstat <- setdiff(upregulated_late_jakstat, upregulated_early_jakstat)
+up_both_jakstat <- intersect(upregulated_early_jakstat, upregulated_late_jakstat)
+
+# Custom text annotations for JAK/STAT and JNK counts
+grid.text(paste("JAK/STAT-JNK\nEarly Only:", length(up_early_only_jakstat)), 
+          x = 0.925, y = 0.475, gp = gpar(fontsize = 15, col = "black"))  # Adjust x, y as needed
+
+grid.text(paste("JAK/STAT-JNK\nLate Only:", length(up_late_only_jakstat)), 
+          x = 0.275, y = 0.475, gp = gpar(fontsize = 15, col = "black"))  
+
+grid.text(paste("JAK/STAT-JNK\nBoth:", length(up_both_jakstat)), 
+          x = 0.7, y = 0.475, gp = gpar(fontsize = 15, col = "black"))  
+
+# Save the plot with annotations
+up_venn_file <- file.path(diff_expr_directory, "venn_upregulated.png")
+ggsave(up_venn_file, plot = grid.grab(), width = 10, height = 10, dpi = 300)
+```
+
+```{r Down-regulated Venn Diagram}
+# Create Venn diagram in memory (without directly saving it)
+down_venn <- venn.diagram(
+  x = list(
+    Early_Downregulated = early_downregulated$genes,
+    Late_Downregulated = late_downregulated$genes
+  ),
+  category.names = c("Early Downregulated", "Late Downregulated"),
+  filename = NULL,  # Do not save immediately
+  output = TRUE,
+  imagetype = "png",
+  height = 3000, width = 3250, resolution = 300,
+  lwd = 2,
+  fill = c("#56B4E9", "#E69F00"),
+  alpha = 0.5,
+  cex = 5,  # Increase font size of the numbers
+  cat.cex = 2,  # Increase font size of the category names
+  cat.pos = c(-15, 15),
+  cat.dist = 0.05,
+  euler.d = TRUE,
+  scaled = TRUE
+)
+
+# Render the Venn diagram on the grid
+grid.draw(down_venn)
+
+# Find JAK/STAT genes in each category
+downregulated_early_jakstat <- intersect(early_downregulated$gene_id, jakjnk_data$ID)
+downregulated_late_jakstat <- intersect(late_downregulated$gene_id, jakjnk_data$ID)
+
+# Count JAK/STAT genes in each section of the down-regulated Venn diagram
+down_early_only_jakstat <- setdiff(downregulated_early_jakstat,
+                                   downregulated_late_jakstat)
+down_late_only_jakstat <- setdiff(downregulated_late_jakstat,
+                                  downregulated_early_jakstat)
+down_both_jakstat <- intersect(downregulated_early_jakstat,
+                               downregulated_late_jakstat)
+
+# Custom text annotations for JAK/STAT and JNK counts
+grid.text(paste("JAK/STAT-JNK\nEarly Only:", length(down_early_only_jakstat)), 
+          x = 0.825, y = 0.465, gp = gpar(fontsize = 15, col = "black"))
+
+grid.text(paste("JAK/STAT-JNK\nLate Only:", length(down_late_only_jakstat)), 
+          x = 0.2, y = 0.465, gp = gpar(fontsize = 15, col = "black")) 
+
+grid.text(paste("JAK/STAT-JNK\nBoth:", length(down_both_jakstat)), 
+          x = 0.5, y = 0.465, gp = gpar(fontsize = 15, col = "black"))
+
+
+# Save the plot with annotations
+down_venn_file <- file.path(diff_expr_directory, "venn_downregulated.png")
+ggsave(down_venn_file, plot = grid.grab(), width = 10, height = 10, dpi = 300)
+```
+
+## Gene Enrichment Analysis
+
+This section conducts gene ontology (GO) enrichment analysis for differentially expressed genes.
+
+```{r GO Prepare}
+# Identify differentially expressed genes (e.g., adj.P.Val <= 0.05 and |logFC| >= 2)
+early_genes <- rownames(early_results[abs(early_results$early_logFC) >= 2 & 
+                                        early_results$early_adj.P.Val <= 0.05, ])
+late_genes <- rownames(late_results[abs(late_results$late_logFC) >= 2 & 
+                                      late_results$late_adj.P.Val <= 0.05, ])
+
+# Convert FlyBase IDs to Entrez IDs (required for clusterProfiler)
+early_genes_entrez <- mapIds(org.Dm.eg.db, 
+                             keys = early_genes, 
+                             column = "ENTREZID", 
+                             keytype = "FLYBASE", 
+                             multiVals = "first")
+late_genes_entrez <- mapIds(org.Dm.eg.db, 
+                            keys = late_genes, 
+                            column = "ENTREZID", 
+                            keytype = "FLYBASE", 
+                            multiVals = "first")
+
+# Remove NAs
+early_genes_entrez <- na.omit(early_genes_entrez)
+late_genes_entrez <- na.omit(late_genes_entrez)
+```
+
+```{r GO Analysis}
+# GO Enrichment for genes differentially expressed in early stage
+go_enrichment_early <- enrichGO(gene = early_genes_entrez,
+                                OrgDb = org.Dm.eg.db,
+                                keyType = "ENTREZID",
+                                ont = "ALL",
+                                pAdjustMethod = "BH",
+                                pvalueCutoff = 0.05,
+                                qvalueCutoff = 0.2)
+
+# GO Enrichment for genes differentially expressed in late stage
+go_enrichment_late <- enrichGO(gene = late_genes_entrez,
+                               OrgDb = org.Dm.eg.db,
+                               keyType = "ENTREZID",
+                               ont = "ALL",
+                               pAdjustMethod = "BH",
+                               pvalueCutoff = 0.05,
+                               qvalueCutoff = 0.2)
+
+```
+
+```{r Visualize GO}
+# Dotplot for GO enrichment in early stage
+go_plot_early <- dotplot(go_enrichment_early, showCategory = 20) + 
+                 ggtitle("GO Enrichment - Early Stage")
+
+# Dotplot for GO enrichment in late stage
+go_plot_late <- dotplot(go_enrichment_late, showCategory = 20) + 
+                ggtitle("GO Enrichment - Late Stage")
+
+# Save the plots
+ggsave(file.path(diff_expr_directory, "go_enrichment_early.png"), 
+       plot = go_plot_early, width = 10, height = 6, dpi = 300)
+ggsave(file.path(diff_expr_directory, "go_enrichment_late.png"), 
+       plot = go_plot_late, width = 10, height = 6, dpi = 300)
+
+# You can also export the results to a table for further analysis
+write.table(as.data.frame(go_enrichment_early), file = file.path(diff_expr_directory, "go_enrichment_early.tsv"), sep = "\t", row.names = FALSE)
+write.table(as.data.frame(go_enrichment_late), file = file.path(diff_expr_directory, "go_enrichment_late.tsv"), sep = "\t", row.names = FALSE)
+
+print(go_plot_early)
+print(go_plot_late)
+```
+
+## List of all utilized packages and their versions
+
+This section documents the session info, including software versions used.
+
+```{r SessionInfo}
+# Save session information to a text file
+session_info_file <- file.path(diff_expr_directory, 
+                               "DGE_GO_session_info.txt")
+
+# Capture the output of sessionInfo and write it to the file
+capture.output(sessionInfo(), file = session_info_file)
+
+# Optional: Print a message to confirm the file was saved
+message("Session information saved to: ", session_info_file)
+```
